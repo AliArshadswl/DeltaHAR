@@ -1,0 +1,1030 @@
+"""
+adl_patchhar_v2_ablation.py
+============================
+Independent one-at-a-time ablation sweep over:
+  - D_MODEL  : [64, 128, 256, 384, 512, 768*]   (baseline=768)
+  - N_HEADS  : [2, 4, 6, 8, 12*]                (baseline=12)
+  - N_LAYERS : [2, 4, 6, 8, 12*]                (baseline=12)
+  - N_EXPERTS: [5]   <- set to N_CLASSES         (baseline=4)
+
+D_MODEL is always kept divisible by the current N_HEADS with even per-head dim.
+When sweeping D_MODEL, N_HEADS is fixed at baseline (12); only values where
+  D_MODEL % N_HEADS == 0  AND  (D_MODEL // N_HEADS) % 2 == 0
+are used.
+
+Each configuration runs the full LOGO CV and results are written to:
+  ablation_results.json   (machine-readable)
+  ablation_results.txt    (human-readable table)
+
+Based on:
+  adl_patchhar_v2_logo.py  --  PatchHAR v2 (all 10 contributions) for ADL
+"""
+
+from __future__ import annotations
+import copy, math, os, random, json, warnings, time
+from collections import defaultdict
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+
+warnings.filterwarnings("ignore")
+
+
+# =============================================================================
+# Ablation sweep definition
+# =============================================================================
+BASELINE = dict(D_MODEL=768, N_HEADS=12, N_LAYERS=12, N_EXPERTS=4)
+
+# Each entry is (param_name, value_to_test)
+# D_MODEL candidates: must satisfy D_MODEL % N_HEADS==0 and (D_MODEL//N_HEADS)%2==0
+# with N_HEADS=12 (baseline): per-head dim must be even -> D_MODEL multiples of 24
+_D_MODEL_CANDIDATES = [d for d in [64, 128, 256, 384, 512, 768]
+                        if d % BASELINE["N_HEADS"] == 0
+                        and (d // BASELINE["N_HEADS"]) % 2 == 0]
+
+SWEEP_CONFIGS: List[Dict] = []
+
+# 1. Sweep D_MODEL (hold N_HEADS=12, N_LAYERS=12, N_EXPERTS=4)
+for d in _D_MODEL_CANDIDATES:
+    if d != BASELINE["D_MODEL"]:          # skip exact baseline (added once at end)
+        SWEEP_CONFIGS.append({**BASELINE, "D_MODEL": d, "_label": f"D_MODEL={d}"})
+
+# 2. Sweep N_HEADS (hold D_MODEL=768, N_LAYERS=12, N_EXPERTS=4)
+#    Per-head dim = 768 // N_HEADS must be even and > 0
+for h in [2, 4, 6, 8, 12]:
+    if h != BASELINE["N_HEADS"] and BASELINE["D_MODEL"] % h == 0 \
+            and (BASELINE["D_MODEL"] // h) % 2 == 0:
+        SWEEP_CONFIGS.append({**BASELINE, "N_HEADS": h, "_label": f"N_HEADS={h}"})
+
+# 3. Sweep N_LAYERS (hold everything else at baseline)
+for l in [2, 4, 6, 8, 12]:
+    if l != BASELINE["N_LAYERS"]:
+        SWEEP_CONFIGS.append({**BASELINE, "N_LAYERS": l, "_label": f"N_LAYERS={l}"})
+
+# 4. Sweep N_EXPERTS = N_CLASSES = 5
+SWEEP_CONFIGS.append({**BASELINE, "N_EXPERTS": 5, "_label": "N_EXPERTS=5(=N_CLASSES)"})
+
+# Append true baseline last for comparison
+SWEEP_CONFIGS.append({**BASELINE, "_label": "BASELINE"})
+
+print(f"Total ablation configurations: {len(SWEEP_CONFIGS)}")
+for c in SWEEP_CONFIGS:
+    print(f"  {c['_label']:35s}  "
+          f"D={c['D_MODEL']:4d} H={c['N_HEADS']:2d} "
+          f"L={c['N_LAYERS']:2d} E={c['N_EXPERTS']}")
+
+
+# =============================================================================
+# 1.  Contribution flags  (all ON — same as original)
+# =============================================================================
+class ContribConfig:
+    C1_DUAL_DOMAIN_EMBEDDING   = True
+    C2_CALANET_SKIP_AGG        = True
+    C3_CIRCADIAN_BIAS          = False   # disabled — no timestamps in ADL
+    C4_MULTISCALE_PATCHING     = True
+    C5_FREQ_AUGMENTATION       = True
+    C6_LABEL_SMOOTH_TEMP       = True
+    C7_PROTOTYPE_MEMORY        = True
+    C8_STOCHASTIC_DEPTH        = True
+    C9_MANIFOLD_MIXUP          = True
+    C10_RECON_AUX_GRAD_SURGERY = True
+
+CC = ContribConfig()
+
+
+# =============================================================================
+# 2.  Configuration  (mutable at runtime per sweep step)
+# =============================================================================
+class Config:
+    # Data
+    LOCAL_DATA_DIR = Path("/home/ali/ADL/adl_30hz_clean")
+    REMOTE_BASE    = ("https://github.com/OxWearables/ssl-wearables"
+                      "/raw/main/data/adl_30hz_clean")
+
+    SIGNAL_RATE = 30
+    WINDOW_SIZE = 300
+    PATCH_LEN   = 30
+    CHANNELS    = 3
+
+    PATCH_LENS_MULTI = [15, 30, 60]
+    N_PATCHES        = WINDOW_SIZE // PATCH_LEN   # 10
+
+    # Model  (overwritten per sweep step)
+    D_MODEL     = 768
+    N_HEADS     = 12
+    N_LAYERS    = 12
+    N_EXPERTS   = 4
+    DROPOUT     = 0.1
+    SD_DROP_MAX = 0.10
+
+    LABEL_SMOOTH_EPS = 0.05
+    PROTO_MOMENTUM   = 0.95
+    PROTO_ALPHA      = 0.30
+    RECON_LAMBDA     = 0.10
+
+    BATCH_SIZE          = 32
+    EPOCHS              = 100
+    LR                  = 1e-4
+    WEIGHT_DECAY        = 2e-4
+    MAX_GRAD_NORM       = 1.0
+    WARMUP_FRAC         = 0.07
+    EARLY_STOP_PATIENCE = 30
+    EMA_DECAY           = 0.995
+    MIXUP_ALPHA         = 0.20
+    TC_LAMBDA           = 0.05
+
+    TEMP_MAX_ITERS = 500
+    TEMP_LR        = 5e-2
+    TEMP_CLAMP     = (0.05, 10.0)
+
+    HMM_SMOOTH   = 1.0
+    HMM_MIN_PROB = 1e-6
+
+    SEED = 42
+
+
+cfg = Config()
+
+
+# =============================================================================
+# 3.  Reproducibility & device
+# =============================================================================
+def seed_everything(seed=42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+seed_everything(cfg.SEED)
+
+GPU    = torch.cuda.is_available()
+device = torch.device("cuda" if GPU else "cpu")
+print(f"\nDevice: {device}")
+if GPU: print(f"  GPU: {torch.cuda.get_device_name(0)}")
+
+
+def amp_ctx():
+    if GPU:
+        try:    return torch.autocast(device_type="cuda", dtype=torch.float16)
+        except Exception:
+            from torch.cuda.amp import autocast; return autocast()
+    return nullcontext()
+
+
+# =============================================================================
+# 4.  ADL data loading  (unchanged)
+# =============================================================================
+def _load_local(data_dir: Path):
+    for fname in ("X.npy", "Y.npy", "pid.npy"):
+        if not (data_dir / fname).exists():
+            raise FileNotFoundError(f"Missing {data_dir / fname}")
+    X   = np.load(data_dir / "X.npy",   allow_pickle=True).astype(np.float32)
+    Y   = np.load(data_dir / "Y.npy",   allow_pickle=True).astype(str)
+    pid = np.load(data_dir / "pid.npy", allow_pickle=True).astype(str)
+    if X.ndim != 3 or X.shape[1] != cfg.WINDOW_SIZE or X.shape[2] != cfg.CHANNELS:
+        raise ValueError(f"Expected X shape (N,{cfg.WINDOW_SIZE},{cfg.CHANNELS}), got {X.shape}")
+    print(f"  Loaded local ADL: X{X.shape}")
+    return X, Y, pid
+
+
+def _load_remote():
+    import requests; from io import BytesIO
+    arrays = {}
+    for fname in ("X.npy", "Y.npy", "pid.npy"):
+        url = f"{cfg.REMOTE_BASE}/{fname}"
+        print(f"  Downloading {fname} ...")
+        r = requests.get(url); r.raise_for_status()
+        arrays[fname[:-4]] = np.load(BytesIO(r.content), allow_pickle=True)
+    X   = arrays["X"].astype(np.float32)
+    Y   = arrays["Y"].astype(str)
+    pid = arrays["pid"].astype(str)
+    print(f"  Downloaded ADL: X{X.shape}")
+    return X, Y, pid
+
+
+def load_adl_data():
+    try:    return _load_local(cfg.LOCAL_DATA_DIR)
+    except Exception as e:
+        print(f"  Local load failed ({e}) — downloading ..."); return _load_remote()
+
+
+def build_all_entries(X, Y, pid, label_encoder):
+    entries = []; by_pid = defaultdict(list)
+    for i, p in enumerate(pid): by_pid[p].append(i)
+    for p, idxs in by_pid.items():
+        for seq_ctr, i in enumerate(idxs):
+            if Y[i] in label_encoder:
+                entries.append((p, X[i], int(label_encoder[Y[i]]), seq_ctr))
+    return entries
+
+
+# =============================================================================
+# 5.  [C5] Frequency-aware augmentation
+# =============================================================================
+def _bandpass_jitter(sig):
+    T, C = sig.shape; out = sig.copy(); band = random.choice(["low","mid","high"])
+    for c in range(C):
+        f = np.fft.rfft(out[:, c]); n = len(f)
+        if   band == "low":  f[n//3:] = 0
+        elif band == "mid":  f[:n//4] = 0; f[n//2:] = 0
+        else:                f[:2*n//3] = 0
+        out[:, c] = np.fft.irfft(f, n=T)
+    return out
+
+def _axis_permute(sig):
+    idx = list(range(sig.shape[1])); random.shuffle(idx); return sig[:, idx]
+
+def _magnitude_scale(sig):
+    return sig * np.random.uniform(0.8, 1.2, (1, sig.shape[1]))
+
+def _time_warp(sig):
+    T, C = sig.shape; factor = random.choice([0.9, 0.95, 1.05, 1.1])
+    nT   = max(T, int(round(T * factor)))
+    warp = np.zeros((nT, C), dtype=sig.dtype)
+    for c in range(C):
+        warp[:, c] = np.interp(np.linspace(0, T-1, nT), np.arange(T), sig[:, c])
+    return warp[:T] if nT >= T else np.pad(warp, ((0, T-nT), (0,0)))
+
+def freq_augment(sig):
+    return random.choice([_bandpass_jitter, _axis_permute,
+                          _magnitude_scale, _time_warp])(sig)
+
+
+# =============================================================================
+# 6.  Dataset & DataLoader
+# =============================================================================
+class ADLDataset(Dataset):
+    def __init__(self, entries, pid_to_idx, is_train=False):
+        self.entries    = entries
+        self.pid_to_idx = pid_to_idx
+        self.is_train   = is_train
+        self.patch_lens = (cfg.PATCH_LENS_MULTI if CC.C4_MULTISCALE_PATCHING
+                           else [cfg.PATCH_LEN])
+
+    def __len__(self): return len(self.entries)
+
+    @staticmethod
+    def _normalise(win):
+        mu = np.nanmean(win, axis=0, keepdims=True)
+        sd = np.nanstd(win,  axis=0, keepdims=True)
+        return np.clip((win - mu) / (sd + 1e-8), -10, 10).astype(np.float32)
+
+    @staticmethod
+    def _make_patches(seg, pl):
+        T, C = seg.shape; n = T // pl
+        return seg[:n*pl].reshape(n, pl, C).transpose(2, 0, 1).astype(np.float32)
+
+    def __getitem__(self, idx):
+        pid_str, win, lab, seq = self.entries[idx]
+        seg = self._normalise(win)
+        if self.is_train and CC.C5_FREQ_AUGMENTATION: seg = freq_augment(seg)
+        patches_list = [torch.from_numpy(self._make_patches(seg, pl))
+                        for pl in self.patch_lens]
+        return (patches_list,
+                torch.tensor(lab,  dtype=torch.long),
+                torch.tensor(self.pid_to_idx[pid_str], dtype=torch.long),
+                torch.tensor(seq,  dtype=torch.long),
+                torch.from_numpy(seg.astype(np.float32)))
+
+
+def _collate(batch):
+    patches_lists, labels, pids, seqs, raws = zip(*batch)
+    n_scales = len(patches_lists[0])
+    return ([torch.stack([b[s] for b in patches_lists]) for s in range(n_scales)],
+            torch.stack(labels), torch.stack(pids),
+            torch.stack(seqs),   torch.stack(raws))
+
+
+def make_loader(entries, pid_to_idx, batch_size=32,
+                shuffle=False, sampler_weights=None, is_train=False):
+    ds = ADLDataset(entries, pid_to_idx, is_train=is_train)
+    if sampler_weights is not None:
+        sampler = WeightedRandomSampler(sampler_weights,
+                                        num_samples=len(sampler_weights),
+                                        replacement=True)
+        dl = DataLoader(ds, batch_size=batch_size, sampler=sampler,
+                        num_workers=4, pin_memory=GPU, collate_fn=_collate)
+    else:
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                        num_workers=4, pin_memory=GPU, collate_fn=_collate)
+    return ds, dl
+
+
+# =============================================================================
+# 7.  Training utilities
+# =============================================================================
+class WarmupCosine:
+    def __init__(self, opt, warmup_steps, total_steps, min_lr=1e-6):
+        self.opt  = opt; self.ws = max(1, warmup_steps)
+        self.ts   = max(self.ws+1, total_steps); self.min = min_lr
+        self.base = cfg.LR; self.i = 0
+
+    def step(self):
+        self.i += 1
+        if self.i < self.ws: lr = self.base * self.i / self.ws
+        else:
+            t  = (self.i - self.ws) / max(1, self.ts - self.ws)
+            lr = self.min + 0.5 * (self.base - self.min) * (1 + math.cos(math.pi * t))
+        for g in self.opt.param_groups: g["lr"] = lr
+
+
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay  = decay
+        self.shadow = {n: p.detach().clone()
+                       for n, p in model.named_parameters() if p.requires_grad}
+
+    def update(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = (self.decay * self.shadow[n]
+                                  + (1. - self.decay) * p.detach())
+
+    def copy_to(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad: p.data.copy_(self.shadow[n])
+
+
+def class_weights_from_entries(entries, K):
+    counts = np.zeros(K, dtype=np.int64)
+    for _, _, lab, _ in entries: counts[lab] += 1
+    w = counts.max() / np.clip(counts, 1, None)
+    w = torch.tensor(w, dtype=torch.float32)
+    return w / w.sum() * K
+
+
+def sample_weights_from_entries(entries, K):
+    counts = np.zeros(K, dtype=np.int64)
+    for _, _, lab, _ in entries: counts[lab] += 1
+    inv = counts.max() / np.clip(counts, 1, None)
+    w   = np.array([inv[lab] for (_, _, lab, _) in entries], dtype=np.float32)
+    return torch.tensor(w, dtype=torch.float32)
+
+
+# =============================================================================
+# 8.  Model building blocks  (use cfg.* so they pick up sweep overrides)
+# =============================================================================
+class ZCRMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-8):
+        super().__init__(); self.g = nn.Parameter(torch.ones(d)); self.eps = eps
+    def forward(self, x):
+        x0 = x - x.mean(-1, keepdim=True)
+        return x0 / x0.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.g
+
+
+class StochasticDepth(nn.Module):
+    def __init__(self, layer, survival_prob):
+        super().__init__(); self.layer = layer; self.p = survival_prob
+    def forward(self, x, *a, **kw):
+        if not self.training or self.p >= 1.0: return self.layer(x, *a, **kw)
+        if random.random() > self.p: return x
+        return self.layer(x, *a, **kw)
+
+
+class GatedDeltaNet(nn.Module):
+    def __init__(self, d, dropout=0.1):
+        super().__init__()
+        self.norm      = ZCRMSNorm(d)
+        self.q_lin     = nn.Linear(d, d); self.k_lin = nn.Linear(d, d); self.v_lin = nn.Linear(d, d)
+        self.q_conv    = nn.Conv1d(d, d, 3, padding=1, groups=d)
+        self.k_conv    = nn.Conv1d(d, d, 3, padding=1, groups=d)
+        self.v_conv    = nn.Conv1d(d, d, 3, padding=1, groups=d)
+        self.act       = nn.Sigmoid()
+        self.alpha     = nn.Linear(d, d); self.beta = nn.Linear(d, d)
+        self.post_norm = ZCRMSNorm(d); self.post = nn.Linear(d, d)
+        self.silu      = nn.SiLU(); self.gate = nn.Sigmoid()
+        self.drop      = nn.Dropout(dropout)
+
+    @staticmethod
+    def _l2(x, eps=1e-8): return x / (x.pow(2).sum(-1, keepdim=True).add(eps).sqrt())
+
+    def forward(self, x):
+        h = self.norm(x)
+        q = self.act(self.q_conv(self.q_lin(h).transpose(1,2)).transpose(1,2))
+        k = self.act(self.k_conv(self.k_lin(h).transpose(1,2)).transpose(1,2))
+        v = self.act(self.v_conv(self.v_lin(h).transpose(1,2)).transpose(1,2))
+        q, k  = self._l2(q), self._l2(k)
+        delta = q * (k * v)
+        delta = torch.tanh(self.alpha(x)) * delta + self.beta(x)
+        dhat  = self.post(self.post_norm(delta))
+        return x + self.drop(self.gate(self.silu(dhat)) * dhat)
+
+
+class SoftMoE(nn.Module):
+    def __init__(self, d, hidden, n_experts=4, dropout=0.1):
+        super().__init__()
+        self.router  = nn.Linear(d, n_experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(d, hidden), nn.SiLU(),
+                          nn.Dropout(dropout), nn.Linear(hidden, d))
+            for _ in range(n_experts)
+        ])
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        w = torch.softmax(self.router(x), dim=-1)
+        s = torch.stack([e(x) for e in self.experts], dim=-2)
+        return self.drop((w.unsqueeze(-1) * s).sum(-2))
+
+
+def precompute_freqs(dim, n_tok, theta=10000.0):
+    assert dim % 2 == 0
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    return torch.polar(torch.ones(n_tok, dim//2),
+                       torch.outer(torch.arange(n_tok, dtype=torch.float32), freqs))
+
+def apply_rope(q, k, freqs):
+    B, H, N, D = q.shape; d2 = D // 2
+    f  = freqs[:N].to(q.device).view(1, 1, N, d2)
+    qc = torch.view_as_complex(q.float().contiguous().view(B, H, N, d2, 2))
+    kc = torch.view_as_complex(k.float().contiguous().view(B, H, N, d2, 2))
+    return (torch.view_as_real(qc*f).view(B, H, N, D).type_as(q),
+            torch.view_as_real(kc*f).view(B, H, N, D).type_as(k))
+
+
+class GatedAttention(nn.Module):
+    def __init__(self, d, n_heads=2, dropout=0.1):
+        super().__init__()
+        assert d % n_heads == 0 and (d // n_heads) % 2 == 0, \
+            f"Per-head dim must be even for RoPE (d={d}, h={n_heads})"
+        self.h    = n_heads; self.dh = d // n_heads
+        self.norm = ZCRMSNorm(d); self.qkv = nn.Linear(d, 3*d)
+        self.out  = nn.Linear(d, d); self.gate = nn.Linear(d, d)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, freqs):
+        h = self.norm(x); B, N, D = h.shape
+        qkv = self.qkv(h).reshape(B, N, 3, self.h, self.dh).permute(0,2,1,3,4)
+        q = qkv[:,0].transpose(1,2); k = qkv[:,1].transpose(1,2); v = qkv[:,2].transpose(1,2)
+        q, k = apply_rope(q, k, freqs)
+        attn = self.drop(torch.softmax((q @ k.transpose(-2,-1)) / math.sqrt(self.dh), dim=-1))
+        y    = self.out((attn @ v).transpose(1,2).contiguous().reshape(B, N, D))
+        return x + torch.sigmoid(self.gate(h)) * y
+
+
+class DualDomainPatchEmbed(nn.Module):
+    def __init__(self, patch_len, channels, d):
+        super().__init__()
+        in_dim   = patch_len * channels
+        freq_dim = (patch_len // 2 + 1) * channels
+        self.time_proj = nn.Linear(in_dim, d)
+        self.freq_proj = nn.Linear(freq_dim, d)
+        self.gate_w    = nn.Parameter(torch.zeros(d))
+
+    def forward(self, patches):
+        B, C, NP, PL = patches.shape
+        t_emb = self.time_proj(patches.permute(0,2,1,3).reshape(B, NP, C*PL))
+        mag   = torch.fft.rfft(patches.permute(0,2,3,1), dim=2).abs()
+        f_emb = self.freq_proj(mag.reshape(B, NP, -1))
+        g     = torch.sigmoid(self.gate_w)
+        return g * t_emb + (1 - g) * f_emb
+
+
+class SimplePatchEmbed(nn.Module):
+    def __init__(self, patch_len, channels, d):
+        super().__init__(); self.proj = nn.Linear(patch_len * channels, d)
+    def forward(self, patches):
+        B, C, NP, PL = patches.shape
+        return self.proj(patches.permute(0,2,1,3).reshape(B, NP, C*PL))
+
+
+class SkipAggregation(nn.Module):
+    def __init__(self, d, n_layers):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(n_layers) / n_layers)
+        self.proj    = nn.Sequential(nn.Linear(d, d), nn.SiLU())
+    def forward(self, hiddens):
+        w = torch.softmax(self.weights, dim=0)
+        return self.proj(sum(w[i] * hiddens[i] for i in range(len(hiddens))))
+
+
+class ReconHead(nn.Module):
+    def __init__(self, d, n_patches, channels):
+        super().__init__()
+        out_dim  = n_patches * channels
+        self.mlp = nn.Sequential(nn.Linear(d, 2*d), nn.ReLU(), nn.Linear(2*d, out_dim))
+    def forward(self, z): return self.mlp(z)
+
+
+# =============================================================================
+# 9.  PatchHAR v2  (reads cfg.* at construction time)
+# =============================================================================
+class PatchHARv2(nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        d  = cfg.D_MODEL
+        NP = cfg.N_PATCHES
+
+        self.patch_lens = (cfg.PATCH_LENS_MULTI if CC.C4_MULTISCALE_PATCHING
+                           else [cfg.PATCH_LEN])
+        EmbedCls = (DualDomainPatchEmbed if CC.C1_DUAL_DOMAIN_EMBEDDING
+                    else SimplePatchEmbed)
+        self.patch_embeds = nn.ModuleList([
+            EmbedCls(pl, cfg.CHANNELS, d) for pl in self.patch_lens
+        ])
+
+        if CC.C4_MULTISCALE_PATCHING and len(self.patch_lens) > 1:
+            self.scale_fusion = nn.Linear(d * len(self.patch_lens), d)
+        else:
+            self.scale_fusion = None
+
+        self.input_norm = nn.LayerNorm(d)
+
+        raw_layers = [GatedDeltaNet(d, dropout=cfg.DROPOUT) for _ in range(cfg.N_LAYERS)]
+        if CC.C8_STOCHASTIC_DEPTH:
+            survs = [1.0 - (i / cfg.N_LAYERS) * cfg.SD_DROP_MAX for i in range(cfg.N_LAYERS)]
+            self.delta_layers = nn.ModuleList([StochasticDepth(l, p)
+                                               for l, p in zip(raw_layers, survs)])
+        else:
+            self.delta_layers = nn.ModuleList(raw_layers)
+
+        if CC.C2_CALANET_SKIP_AGG:
+            self.skip_agg = SkipAggregation(d, cfg.N_LAYERS)
+
+        self.moe1 = SoftMoE(d, 2*d, cfg.N_EXPERTS, cfg.DROPOUT)
+        self.attn = GatedAttention(d, cfg.N_HEADS, cfg.DROPOUT)
+        self.moe2 = SoftMoE(d, 2*d, cfg.N_EXPERTS, cfg.DROPOUT)
+
+        freqs = precompute_freqs(d // cfg.N_HEADS, NP)
+        self.register_buffer("freqs", freqs)
+
+        if CC.C6_LABEL_SMOOTH_TEMP:
+            self.log_tau = nn.Parameter(torch.zeros(1))
+
+        if CC.C10_RECON_AUX_GRAD_SURGERY:
+            self.recon_head = ReconHead(d, NP, cfg.CHANNELS)
+
+        if CC.C7_PROTOTYPE_MEMORY:
+            self.register_buffer("prototypes", torch.zeros(num_classes, d))
+            self.proto_filled = False
+
+        self.num_classes = num_classes
+        self.head = nn.Sequential(
+            nn.Dropout(0.2), nn.Linear(d, d//2), nn.ReLU(),
+            nn.Dropout(0.1), nn.Linear(d//2, num_classes),
+        )
+
+    def _embed(self, patches_list):
+        NP = cfg.N_PATCHES
+        if CC.C4_MULTISCALE_PATCHING and len(patches_list) > 1:
+            embs = []
+            for embed, p in zip(self.patch_embeds, patches_list):
+                e = embed(p)
+                e = F.interpolate(e.permute(0,2,1), size=NP, mode="linear",
+                                  align_corners=False).permute(0,2,1)
+                embs.append(e)
+            return self.scale_fusion(torch.cat(embs, dim=-1))
+        return self.patch_embeds[0](patches_list[0])
+
+    def _backbone(self, x):
+        x = self.input_norm(x); hiddens = []
+        for layer in self.delta_layers:
+            x = layer(x); hiddens.append(x)
+        if CC.C2_CALANET_SKIP_AGG: x = x + self.skip_agg(hiddens)
+        x = x + self.moe1(x)
+        x = self.attn(x, self.freqs)
+        x = x + self.moe2(x)
+        return x.mean(dim=1), hiddens
+
+    def forward(self, patches_list, return_embedding=False):
+        x      = self._embed(patches_list)
+        z, _   = self._backbone(x)
+        if return_embedding: return z
+        recon  = None
+        if CC.C10_RECON_AUX_GRAD_SURGERY and self.training:
+            recon = self.recon_head(z)
+        logits = self.head(z)
+        if CC.C6_LABEL_SMOOTH_TEMP:
+            tau    = torch.exp(self.log_tau).clamp(0.5, 2.0)
+            logits = logits / tau
+        if CC.C7_PROTOTYPE_MEMORY and not self.training and self.proto_filled:
+            z_n    = F.normalize(z, dim=-1)
+            pr_n   = F.normalize(self.prototypes, dim=-1)
+            cosine = z_n @ pr_n.T
+            logits = (1 - cfg.PROTO_ALPHA) * logits + cfg.PROTO_ALPHA * cosine
+        return logits, recon
+
+    @torch.no_grad()
+    def update_prototypes(self, embs, labels):
+        m = cfg.PROTO_MOMENTUM
+        for k in range(self.num_classes):
+            mask = (labels == k)
+            if mask.sum() == 0: continue
+            mean = embs[mask].mean(0)
+            self.prototypes[k] = (m * self.prototypes[k] + (1-m) * mean
+                                  if self.proto_filled else mean)
+        self.proto_filled = True
+
+
+# =============================================================================
+# 10.  Loss helpers
+# =============================================================================
+class SmoothCE(nn.Module):
+    def __init__(self, weight=None, smoothing=0.0):
+        super().__init__(); self.eps = smoothing; self.w = weight
+    def forward(self, logits, labels):
+        K    = logits.size(-1)
+        soft = torch.full_like(logits, self.eps / max(K-1, 1))
+        soft.scatter_(-1, labels.unsqueeze(-1), 1.0 - self.eps)
+        loss = -(soft * F.log_softmax(logits, dim=-1)).sum(-1)
+        if self.w is not None: loss = loss * self.w.to(logits.device)[labels]
+        return loss.mean()
+
+
+def recon_loss_fn(recon, raw_segs):
+    B, T, C = raw_segs.shape; NP, PL = cfg.N_PATCHES, cfg.PATCH_LEN
+    target  = (raw_segs[:, :NP*PL, :].reshape(B, NP, PL, C)
+               .mean(dim=2).reshape(B, NP*C))
+    return F.mse_loss(recon, target.detach())
+
+
+def tc_loss(logits):
+    if logits.size(0) < 2: return logits.new_zeros(1).squeeze()
+    p = F.softmax(logits[:-1], dim=-1); q = F.softmax(logits[1:], dim=-1)
+    return 0.5 * (F.kl_div(q.log(), p, reduction="batchmean") +
+                  F.kl_div(p.log(), q, reduction="batchmean"))
+
+
+def manifold_mixup(z, labels, alpha=0.2):
+    if alpha <= 0: return z, labels, labels, 1.0
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(z.size(0), device=z.device)
+    return lam*z + (1-lam)*z[idx], labels, labels[idx], lam
+
+
+# =============================================================================
+# 11.  Temperature scaling & HSMM-lite
+# =============================================================================
+class TemperatureScaling(nn.Module):
+    def __init__(self, T_init=1.0):
+        super().__init__(); self.logT = nn.Parameter(torch.tensor(math.log(float(T_init))))
+    def forward(self, logits): return logits / torch.exp(self.logT).clamp(*cfg.TEMP_CLAMP)
+    def temperature(self):
+        with torch.no_grad(): return float(torch.exp(self.logT).clamp(*cfg.TEMP_CLAMP).item())
+
+
+def fit_temperature(logits, labels):
+    ts  = TemperatureScaling().to(device)
+    y   = torch.from_numpy(labels).to(device)
+    x   = logits.to(device).detach()
+    ce  = nn.CrossEntropyLoss()
+    opt = optim.LBFGS(ts.parameters(), lr=cfg.TEMP_LR,
+                      max_iter=cfg.TEMP_MAX_ITERS, line_search_fn="strong_wolfe")
+    def closure():
+        opt.zero_grad(set_to_none=True); loss = ce(ts(x), y); loss.backward(); return loss
+    opt.step(closure)
+    with torch.no_grad(): nll = ce(ts(x), y).item()
+    print(f"    T={ts.temperature():.3f} | val NLL={nll:.4f}")
+    return ts
+
+
+def collect_logits(model, loader):
+    model.eval(); outs, labs, pids_out, seqs_out = [], [], [], []
+    with torch.no_grad():
+        for pl, lbl, pid_idx, seq, _ in loader:
+            pl = [p.to(device).float() for p in pl]
+            logits, _ = model(pl)
+            outs.append(logits.cpu()); labs.extend(lbl.numpy().tolist())
+            pids_out.extend(pid_idx.numpy().tolist()); seqs_out.extend(seq.numpy().tolist())
+    return (torch.cat(outs), np.array(labs), np.array(pids_out), np.array(seqs_out))
+
+
+def estimate_hmm(entries, K):
+    by_pid = defaultdict(list)
+    for pid_str, _, lab, seq in entries: by_pid[pid_str].append((int(seq), int(lab)))
+    A  = np.full((K, K), cfg.HMM_SMOOTH, dtype=np.float64)
+    pi = np.full(K,      cfg.HMM_SMOOTH, dtype=np.float64)
+    for seqs in by_pid.values():
+        seqs.sort(key=lambda x: x[0])
+        if seqs: pi[seqs[0][1]] += 1
+        for (_, a), (_, b) in zip(seqs[:-1], seqs[1:]): A[a, b] += 1
+    A  = np.clip(A / A.sum(1, keepdims=True), cfg.HMM_MIN_PROB, 1.0)
+    pi = np.clip(pi / pi.sum(),               cfg.HMM_MIN_PROB, 1.0)
+    return pi, A
+
+
+def viterbi(E_log, log_pi, log_A, lam=0.75):
+    T, K  = E_log.shape; dp = np.full((T, K), -np.inf); bp = np.full((T, K), -1, dtype=np.int32)
+    dp[0] = log_pi + E_log[0]; penalty = lam * (1 - np.eye(K))
+    for t in range(1, T):
+        prev  = dp[t-1, :, None] + log_A - penalty
+        bp[t] = np.argmax(prev, axis=0)
+        dp[t] = prev[bp[t], np.arange(K)] + E_log[t]
+    path = np.zeros(T, dtype=np.int32); path[-1] = int(np.argmax(dp[-1]))
+    for t in range(T-2, -1, -1): path[t] = bp[t+1, path[t+1]]
+    return path
+
+
+def tune_lambda(ts_model, val_logits, val_true, val_seqs, train_entries, K):
+    pi, A  = estimate_hmm(train_entries, K)
+    log_pi = np.log(np.clip(pi, cfg.HMM_MIN_PROB, 1.0))
+    log_A  = np.log(np.clip(A,  cfg.HMM_MIN_PROB, 1.0))
+    with torch.no_grad():
+        probs = ts_model(val_logits.to(device)).softmax(1).cpu().numpy()
+    order = np.argsort(val_seqs)
+    E_log = np.log(np.clip(probs[order], cfg.HMM_MIN_PROB, 1.0))
+    best_lam, best_f1 = 0.75, -1.0
+    for lam in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5]:
+        path = viterbi(E_log, log_pi, log_A, lam)
+        pred = np.empty_like(path); pred[order] = path
+        f1   = f1_score(val_true, pred, average="macro", zero_division=0)
+        if f1 > best_f1: best_f1, best_lam = f1, lam
+    return best_lam, pi, A
+
+
+# =============================================================================
+# 12.  Metrics
+# =============================================================================
+def cohen_kappa(yt, yp):
+    cm = confusion_matrix(yt, yp); n = cm.sum()
+    if n == 0: return 0.0
+    po = np.trace(cm) / n; pe = np.dot(cm.sum(1), cm.sum(0)) / (n*n)
+    return float((po-pe)/(1-pe)) if abs(1-pe) > 1e-12 else 0.0
+
+def multiclass_mcc(yt, yp):
+    cm  = confusion_matrix(yt, yp).astype(float); n = cm.sum()
+    if n == 0: return 0.0
+    s, t, p = np.trace(cm), cm.sum(1), cm.sum(0)
+    num = s*n - np.sum(t*p)
+    den = math.sqrt(max(n**2-np.sum(t**2), 0.) * max(n**2-np.sum(p**2), 0.))
+    return float(num/den) if den > 0 else 0.0
+
+
+# =============================================================================
+# 13.  Single-fold training
+# =============================================================================
+def train_one_fold(model, train_loader, val_loader, class_w, epochs, patience):
+    total  = epochs * max(1, len(train_loader))
+    warmup = int(cfg.WARMUP_FRAC * total)
+    opt    = optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    sched  = WarmupCosine(opt, warmup, total, min_lr=cfg.LR * 0.05)
+    crit   = SmoothCE(weight=class_w.to(device),
+                      smoothing=cfg.LABEL_SMOOTH_EPS if CC.C6_LABEL_SMOOTH_TEMP else 0.0)
+    try:    scaler = torch.amp.GradScaler("cuda", enabled=GPU)
+    except TypeError:
+        from torch.cuda.amp import GradScaler; scaler = GradScaler(enabled=GPU)
+
+    ema = EMA(model, decay=cfg.EMA_DECAY)
+    best_score = -1e9; best_state = None; pat_ctr = 0
+
+    for epoch in range(epochs):
+        model.train()
+        for batch in train_loader:
+            pl, labels, pid_idx, seq, raw_segs = batch
+            pl       = [p.to(device).float() for p in pl]
+            labels   = labels.to(device).view(-1)
+            raw_segs = raw_segs.to(device).float()
+            opt.zero_grad(set_to_none=True)
+
+            if CC.C9_MANIFOLD_MIXUP:
+                with amp_ctx():
+                    x = model._embed(pl); z, _ = model._backbone(x)
+                z_mix, la, lb, lam = manifold_mixup(z, labels, cfg.MIXUP_ALPHA)
+                with amp_ctx():
+                    logits = model.head(z_mix)
+                    if CC.C6_LABEL_SMOOTH_TEMP:
+                        tau = torch.exp(model.log_tau).clamp(0.5, 2.0); logits = logits / tau
+                    loss = lam * crit(logits, la) + (1-lam) * crit(logits, lb)
+                    if cfg.TC_LAMBDA > 0: loss = loss + cfg.TC_LAMBDA * tc_loss(logits)
+                    if CC.C10_RECON_AUX_GRAD_SURGERY:
+                        recon = model.recon_head(z.detach())
+                        loss  = loss + cfg.RECON_LAMBDA * recon_loss_fn(recon, raw_segs)
+            else:
+                with amp_ctx():
+                    logits, recon = model(pl); loss = crit(logits, labels)
+                    if cfg.TC_LAMBDA > 0: loss = loss + cfg.TC_LAMBDA * tc_loss(logits)
+                    if CC.C10_RECON_AUX_GRAD_SURGERY and recon is not None:
+                        loss = loss + cfg.RECON_LAMBDA * recon_loss_fn(recon, raw_segs)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            if torch.isfinite(loss):
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.MAX_GRAD_NORM)
+                scaler.step(opt)
+            else: opt.zero_grad(set_to_none=True)
+            scaler.update(); ema.update(model); sched.step()
+
+        # Validation with EMA
+        bak = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+        ema.copy_to(model); model.eval()
+        vp, vt, embs_v, labs_v = [], [], [], []
+        with torch.no_grad():
+            for pl, lbl, pid_idx, seq, _ in val_loader:
+                pl = [p.to(device).float() for p in pl]
+                if CC.C7_PROTOTYPE_MEMORY:
+                    z = model.forward(pl, return_embedding=True); lg, _ = model(pl)
+                    embs_v.append(z.cpu()); labs_v.append(lbl)
+                else: lg, _ = model(pl)
+                vp.extend(lg.argmax(1).cpu().numpy()); vt.extend(lbl.numpy())
+        if CC.C7_PROTOTYPE_MEMORY and embs_v:
+            model.update_prototypes(torch.cat(embs_v).to(device), torch.cat(labs_v).to(device))
+        for n, p in model.named_parameters():
+            if p.requires_grad: p.data.copy_(bak[n])
+
+        vp = np.array(vp); vt = np.array(vt)
+        f1 = f1_score(vt, vp, average="macro", zero_division=0)
+        kap = cohen_kappa(vt, vp)
+        print(f"    Ep {epoch+1:03d}/{epochs} | F1={f1:.4f} | kappa={kap:.4f}")
+        score = f1 + kap
+        if score > best_score + 1e-6:
+            best_score = score; pat_ctr = 0; ema.copy_to(model)
+            best_state = copy.deepcopy(model.state_dict())
+        else:
+            pat_ctr += 1
+            if pat_ctr >= patience: print("    Early stop"); break
+
+    if best_state is not None: model.load_state_dict(best_state)
+    return model
+
+
+# =============================================================================
+# 14.  LOGO for one model configuration
+# =============================================================================
+def run_logo_for_config(all_pids, by_pid, pid_to_idx, num_classes, label_encoder):
+    """Run full LOGO CV and return (raw_scores, hmm_scores)."""
+    raw_scores, hmm_scores = [], []
+
+    for fold_i, test_pid in enumerate(all_pids):
+        val_pid    = all_pids[(fold_i + 1) % len(all_pids)]
+        train_pids = [p for p in all_pids if p not in (test_pid, val_pid)]
+
+        train_ent = sum([by_pid[p] for p in train_pids], [])
+        val_ent   = by_pid[val_pid]
+        test_ent  = by_pid[test_pid]
+
+        print(f"\n  Fold {fold_i+1}/{len(all_pids)}  test={test_pid}  val={val_pid}")
+        if not val_ent or not test_ent: print("  Skip (empty)"); continue
+
+        train_w     = sample_weights_from_entries(train_ent, num_classes)
+        _, train_dl = make_loader(train_ent, pid_to_idx, cfg.BATCH_SIZE,
+                                  sampler_weights=train_w, is_train=True)
+        _, val_dl   = make_loader(val_ent,   pid_to_idx, cfg.BATCH_SIZE, shuffle=False)
+        _, test_dl  = make_loader(test_ent,  pid_to_idx, cfg.BATCH_SIZE, shuffle=False)
+
+        model   = PatchHARv2(num_classes).to(device)
+        class_w = class_weights_from_entries(train_ent, num_classes)
+        n_param = sum(p.numel() for p in model.parameters())
+        print(f"  Params: {n_param:,}")
+
+        model = train_one_fold(model, train_dl, val_dl, class_w,
+                               cfg.EPOCHS, cfg.EARLY_STOP_PATIENCE)
+
+        val_logits, val_true, _, val_seqs = collect_logits(model, val_dl)
+        ts = fit_temperature(val_logits, val_true)
+
+        best_lam, pi, A = tune_lambda(ts, val_logits, val_true,
+                                      val_seqs, train_ent, num_classes)
+        log_pi = np.log(np.clip(pi, cfg.HMM_MIN_PROB, 1.0))
+        log_A  = np.log(np.clip(A,  cfg.HMM_MIN_PROB, 1.0))
+
+        test_logits, test_true, _, test_seqs = collect_logits(model, test_dl)
+        pred_raw = test_logits.argmax(1).numpy()
+        f1r = f1_score(test_true, pred_raw, average="macro", zero_division=0)
+        kr  = cohen_kappa(test_true, pred_raw)
+        mr  = multiclass_mcc(test_true, pred_raw)
+        print(f"  Raw   F1={f1r:.4f} | kappa={kr:.4f} | MCC={mr:.4f}")
+
+        with torch.no_grad():
+            probs = ts(test_logits.to(device)).softmax(1).cpu().numpy()
+        order    = np.argsort(test_seqs)
+        E_log    = np.log(np.clip(probs[order], cfg.HMM_MIN_PROB, 1.0))
+        path     = viterbi(E_log, log_pi, log_A, lam=best_lam)
+        pred_hmm = np.empty_like(path); pred_hmm[order] = path
+        f1h = f1_score(test_true, pred_hmm, average="macro", zero_division=0)
+        kh  = cohen_kappa(test_true, pred_hmm)
+        mh  = multiclass_mcc(test_true, pred_hmm)
+        print(f"  HSMM  F1={f1h:.4f} | kappa={kh:.4f} | MCC={mh:.4f}")
+
+        raw_scores.append((f1r, kr, mr))
+        hmm_scores.append((f1h, kh, mh))
+
+    return raw_scores, hmm_scores
+
+
+def _summarise(scores):
+    if not scores: return {}
+    arr = np.asarray(scores, dtype=np.float64); m, s = arr.mean(0), arr.std(0)
+    return dict(f1_mean=round(m[0],4), f1_std=round(s[0],4),
+                kappa_mean=round(m[1],4), kappa_std=round(s[1],4),
+                mcc_mean=round(m[2],4), mcc_std=round(s[2],4))
+
+
+# =============================================================================
+# 15.  Main ablation loop
+# =============================================================================
+def run_ablation():
+    print("\n" + "="*65)
+    print("  PatchHAR v2  --  ADL  --  Ablation Sweep")
+    print("="*65)
+
+    print("\nLoading ADL dataset ...")
+    X_data, Y_data, pid_data = load_adl_data()
+
+    unique_labels = sorted(np.unique(Y_data).tolist())
+    label_encoder = {lab: i for i, lab in enumerate(unique_labels)}
+    num_classes   = len(unique_labels)
+    print(f"  Classes ({num_classes}): {unique_labels}")
+
+    all_pids   = sorted(np.unique(pid_data).tolist())
+    pid_to_idx = {p: i for i, p in enumerate(all_pids)}
+    print(f"  Participants: {len(all_pids)}")
+
+    entries_all = build_all_entries(X_data, Y_data, pid_data, label_encoder)
+    by_pid: Dict[str, list] = defaultdict(list)
+    for e in entries_all: by_pid[e[0]].append(e)
+    print(f"  Total windows: {len(entries_all)}")
+
+    all_results = []
+
+    for sweep_idx, sweep_cfg in enumerate(SWEEP_CONFIGS):
+        label = sweep_cfg["_label"]
+        print(f"\n{'='*65}")
+        print(f"  SWEEP {sweep_idx+1}/{len(SWEEP_CONFIGS)}  [{label}]")
+        print(f"  D_MODEL={sweep_cfg['D_MODEL']}  N_HEADS={sweep_cfg['N_HEADS']}  "
+              f"N_LAYERS={sweep_cfg['N_LAYERS']}  N_EXPERTS={sweep_cfg['N_EXPERTS']}")
+        print("="*65)
+
+        # Override cfg with this sweep's values
+        cfg.D_MODEL   = sweep_cfg["D_MODEL"]
+        cfg.N_HEADS   = sweep_cfg["N_HEADS"]
+        cfg.N_LAYERS  = sweep_cfg["N_LAYERS"]
+        cfg.N_EXPERTS = sweep_cfg["N_EXPERTS"]
+
+        # Validate RoPE constraint
+        per_head = cfg.D_MODEL // cfg.N_HEADS
+        assert cfg.D_MODEL % cfg.N_HEADS == 0 and per_head % 2 == 0, \
+            f"RoPE violation: D_MODEL={cfg.D_MODEL}, N_HEADS={cfg.N_HEADS}"
+
+        seed_everything(cfg.SEED)   # reset RNG for each config
+        t0 = time.time()
+
+        raw_scores, hmm_scores = run_logo_for_config(
+            all_pids, by_pid, pid_to_idx, num_classes, label_encoder)
+
+        elapsed = time.time() - t0
+        result  = {
+            "label":      label,
+            "D_MODEL":    sweep_cfg["D_MODEL"],
+            "N_HEADS":    sweep_cfg["N_HEADS"],
+            "N_LAYERS":   sweep_cfg["N_LAYERS"],
+            "N_EXPERTS":  sweep_cfg["N_EXPERTS"],
+            "n_params":   None,   # filled below
+            "elapsed_s":  round(elapsed, 1),
+            "raw":        _summarise(raw_scores),
+            "hsmm":       _summarise(hmm_scores),
+        }
+
+        # Quick param count (rebuild model once)
+        tmp = PatchHARv2(num_classes)
+        result["n_params"] = sum(p.numel() for p in tmp.parameters())
+        del tmp
+
+        all_results.append(result)
+        print(f"\n  [{label}]  raw F1={result['raw'].get('f1_mean','?')}  "
+              f"hsmm F1={result['hsmm'].get('f1_mean','?')}  "
+              f"({elapsed/60:.1f} min)")
+
+        # Save incrementally
+        with open("ablation_results.json", "w") as f:
+            json.dump(all_results, f, indent=2)
+
+    # ── Print final table ─────────────────────────────────────────────────
+    hdr = (f"{'Label':<35} {'D':>5} {'H':>4} {'L':>4} {'E':>4} "
+           f"{'Params':>10}  {'Raw-F1':>7} {'±':>6}  "
+           f"{'HMM-F1':>7} {'±':>6}  {'kappa':>7}  {'MCC':>7}")
+    sep = "-" * len(hdr)
+    lines = ["\n" + "="*65, "  ABLATION RESULTS SUMMARY", sep, hdr, sep]
+
+    for r in all_results:
+        raw  = r.get("raw",  {})
+        hsmm = r.get("hsmm", {})
+        lines.append(
+            f"{r['label']:<35} {r['D_MODEL']:>5} {r['N_HEADS']:>4} "
+            f"{r['N_LAYERS']:>4} {r['N_EXPERTS']:>4} "
+            f"{r['n_params']:>10,}  "
+            f"{raw.get('f1_mean',0):>7.4f} {raw.get('f1_std',0):>6.4f}  "
+            f"{hsmm.get('f1_mean',0):>7.4f} {hsmm.get('f1_std',0):>6.4f}  "
+            f"{hsmm.get('kappa_mean',0):>7.4f}  "
+            f"{hsmm.get('mcc_mean',0):>7.4f}"
+        )
+
+    lines += [sep, ""]
+    table = "\n".join(lines)
+    print(table)
+
+    with open("ablation_results.txt", "w") as f: f.write(table)
+    print("Saved ablation_results.json and ablation_results.txt")
+    return all_results
+
+
+# =============================================================================
+if __name__ == "__main__":
+    run_ablation()
