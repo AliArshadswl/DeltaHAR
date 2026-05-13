@@ -1,5 +1,4 @@
 # Dataset & Evaluation Notes
-# (Give this file to an LLM at the start of any new session)
 
 ---
 
